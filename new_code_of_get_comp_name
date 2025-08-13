@@ -1,0 +1,248 @@
+import os
+import sys
+import re
+import cv2
+import numpy as np
+import pytesseract
+import fitz  # PyMuPDF
+from PyPDF2 import PdfReader, PdfWriter
+from difflib import SequenceMatcher
+
+# === Setup paths ===
+if getattr(sys, 'frozen', False):
+    base_path = os.path.dirname(sys.executable)
+else:
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+tesseract_path = os.path.join(base_path, 'tesseract_portable_windows', 'tesseract.exe')
+pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+pdf_path = os.path.join(base_path, 'Page_7.pdf')
+sorted_pdf_path = os.path.join(base_path, 'Testing_pdf_sorted.pdf')
+
+# === Image preprocessing with no crop deskew ===
+def preprocess_image_for_ocr(cv_img):
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)  # contrast boost
+    gray = cv2.medianBlur(gray, 3)
+
+    thresh = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 2
+    )
+
+    coords = np.column_stack(np.where(thresh > 0))
+    if coords.size > 0:
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        (h, w) = thresh.shape
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+
+        # Calculate new bounds to avoid cropping
+        cos = np.abs(M[0, 0])
+        sin = np.abs(M[0, 1])
+        new_w = int((h * sin) + (w * cos))
+        new_h = int((h * cos) + (w * sin))
+
+        # Adjust translation part of the matrix
+        M[0, 2] += (new_w / 2) - w // 2
+        M[1, 2] += (new_h / 2) - h // 2
+
+        thresh = cv2.warpAffine(thresh, M, (new_w, new_h),
+                               flags=cv2.INTER_CUBIC,
+                               borderMode=cv2.BORDER_REPLICATE)
+    return thresh
+
+# === OCR wrapper ===
+def ocr_text_from_image(image):
+    configs = [
+        '--psm 6 --oem 3',
+        '--psm 3 --oem 3',
+        '--psm 6 --oem 3 -c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/."'
+    ]
+    best_text = ""
+    for config in configs:
+        try:
+            text = pytesseract.image_to_string(image, config=config).strip()
+            if len(text) > len(best_text):
+                best_text = text
+        except Exception:
+            continue
+    # best_text is the whole OCR string
+    lines = best_text.splitlines()
+    for line in lines:
+        # you can process each line here if needed
+        print("Line:", line)
+    return lines
+
+# === Fuzzy match helper ===
+def is_similar(a, b, threshold=0.8):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio() >= threshold
+
+# === Extract info ===
+# def extract_info(lines):
+    # do_no = "UNKNOWN"
+    # company = "UNKNOWN"
+
+    # # Step 1: Find DO number line-by-line
+    # for line in lines:
+    #     match = re.search(
+    #         r'\b(DO|MO|TST)\s*[\.\-:,#]?\s*(No\.?|Number)?\s*[:\-]?\s*([A-Z0-9\-\/]{4,})',
+    #         line,
+    #         re.IGNORECASE
+    #     )
+    #     if match:
+    #         do_no = match.group(3).strip()
+    #         break
+
+    # # Step 2: Find line containing 'Ship To:' (case-insensitive)
+    # shipto_line_index = -1
+    # for idx, line in enumerate(lines):
+    #     if 'ship to:' in line.lower():
+    #         shipto_line_index = idx
+    #         break
+
+    # if shipto_line_index != -1:
+    #     line = lines[shipto_line_index]
+
+    #     # Extract text after 'Ship To:'
+    #     lowered = line.lower()
+    #     pos = lowered.find('ship to:')
+    #     after_shipto = line[pos + len('ship to:'):].strip()
+
+    #     # Check if company name is on same line before known stop words
+    #     stop_keywords = ['attention', 'do no', 'do number', 'do:', 'do', 'tel', 'fax', 'email']
+    #     pattern = re.compile(r'\b(?:' + '|'.join(stop_keywords) + r')\b', re.IGNORECASE)
+    #     parts = pattern.split(after_shipto, maxsplit=1)
+    #     company_candidate = parts[0].strip()
+
+    #     if company_candidate and len(company_candidate) > 2:
+    #         company = company_candidate
+    #         return do_no, company
+
+    #     # Otherwise, look at the next few lines for company name (up to 3 lines)
+    #     company_lines = []
+    #     for j in range(shipto_line_index + 1, min(shipto_line_index + 4, len(lines))):
+    #         l = lines[j].strip()
+    #         if any(sk in l.lower() for sk in stop_keywords):
+    #             break
+    #         if l:
+    #             company_lines.append(l)
+
+    #     if company_lines:
+    #         # Join lines as company name
+    #         company = ' '.join(company_lines).strip()
+    #         return do_no, company
+
+    # # fallback if not found
+    # return do_no, company
+
+def extract_info(lines):
+    do_no = "UNKNOWN"
+    company = "UNKNOWN"
+
+    # Clean lines
+    lines = [l.strip() for l in lines if l.strip()]
+
+    # 1️⃣ Extract DO number
+    do_pattern = re.compile(
+        r'\b(?:DO|MO|TST)\s*[\.\-:,#]?\s*(?:No\.?|Number)?\s*[:\-]?\s*([A-Z0-9\/\-]{4,})',
+        re.IGNORECASE
+    )
+
+    do_line_index = -1
+    for idx, line in enumerate(lines):
+        match = do_pattern.search(line)
+        if match:
+            do_no = match.group(1)
+            do_line_index = idx
+            break
+
+    # 2️⃣ Take next line as company
+    if do_line_index != -1 and do_line_index + 1 < len(lines):
+        company = lines[do_line_index + 1]
+
+    return do_no, company
+
+
+
+# === Page number extractor ===
+def extract_page_no(lines):
+    text = "\n".join(lines)
+    match = re.search(r'Page\s*(?:No\.?)?\s*(\d+)', text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'\b(\d{1,3})\s+of\s+\d{1,3}\b', text)
+    if match:
+        return int(match.group(1))
+    return None
+
+# === Render PDF page to OpenCV image ===
+def render_page_to_image(doc, page_number, dpi=400):
+    page = doc.load_page(page_number)
+    zoom = dpi / 72  # scale factor for DPI
+    rotation = page.rotation
+    mat = fitz.Matrix(zoom, zoom).prerotate(rotation)  # fix here: prerotate, all lowercase
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    cv_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return cv_img
+
+# === Main function ===
+def main(pdf_path):
+    print(f"Reading PDF: {pdf_path}")
+    doc = fitz.open(pdf_path)
+    page_count = doc.page_count
+    print(f"Total pages: {page_count}")
+
+    page_data = []
+
+    for i in range(page_count):
+        # Render page image raw
+        raw_img = render_page_to_image(doc, i, dpi=400)
+        cv2.imwrite(f"page_{i+1}_raw_rendered.png", raw_img)  # save raw image
+
+        # Preprocess image (with improved deskew no crop)
+        preprocessed_img = preprocess_image_for_ocr(raw_img)
+        cv2.imwrite(f"page_{i+1}_preprocessed.png", preprocessed_img)  # save processed image
+
+        # OCR text lines
+        lines = ocr_text_from_image(preprocessed_img)
+        print(f"Page {i+1} OCR lines:", lines)
+
+        do_no, company = extract_info(lines)
+        page_no = extract_page_no(lines)
+
+        page_data.append({
+            "index": i,
+            "do_no": do_no,
+            "company": company,
+            "page_no": page_no
+        })
+
+    # Sort pages as per your criteria
+    sorted_pages = sorted(
+        page_data,
+        key=lambda x: (
+            re.sub(r'\W+', '', x["company"].split()[0]).lower() if x["company"] else "",
+            x["do_no"]
+        )
+    )
+
+    # Print results
+    for page in sorted_pages:
+        print(f"\n=== Page {page['index'] + 1} ===")
+        print(f"Company : {page['company']}")
+        print(f"DO No   : {page['do_no']}")
+        print(f"Page No : {page['page_no']}")
+
+    # You can add PDF sorting and saving here if needed
+
+if __name__ == "__main__":
+    main(pdf_path)
+
+
