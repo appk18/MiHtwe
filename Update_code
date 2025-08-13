@@ -1,0 +1,441 @@
+import sys
+import os
+import re
+import numpy as np
+import cv2
+from pdf2image import convert_from_path
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QPushButton, QLabel, QLineEdit,
+    QVBoxLayout, QHBoxLayout, QFileDialog, QTableWidget,
+    QTableWidgetItem, QHeaderView, QMessageBox, QAbstractItemView,
+    QProgressBar
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QColor, QCursor
+from PyPDF2 import PdfReader, PdfWriter
+import pytesseract
+from ultralytics import YOLO   # YOLO model
+import urllib.parse
+
+# Set base path depending on whether app is frozen or not
+if getattr(sys, 'frozen', False):
+    base_path = os.path.dirname(sys.executable)
+else:
+    base_path = os.path.dirname(os.path.abspath(__file__))
+
+# Poppler path for pdf2image
+poppler_path = os.path.join(base_path, 'Release-24.08.0-0', 'poppler-24.08.0', 'Library', 'bin')
+
+# Load YOLO model once globally
+yolo_model = YOLO("runs/detect/train8/weights/best.pt")
+
+# Output folder for detected images (stamps)
+output_dir = os.path.join(base_path, "detected_images")
+os.makedirs(output_dir, exist_ok=True)
+
+# Result folder for sorted PDFs
+result_folder_full = os.path.join(base_path, "result")
+os.makedirs(result_folder_full, exist_ok=True)
+
+# Button styling function (unchanged)
+def style_button(button, color="#0078D4", hover_color="#005A9E", font_size=12):
+    button.setStyleSheet(f"""
+        QPushButton {{
+            background-color: {color};
+            color: white;
+            font-weight: bold;
+            font-size: {font_size}px;
+            border-radius: 6px;
+            padding: 6px 12px;
+        }}
+        QPushButton:hover {{
+            background-color: {hover_color};
+        }}
+        QPushButton:pressed {{
+            background-color: #004B87;
+        }}
+        QPushButton:disabled {{
+            background-color: gray;
+            color: white;
+        }}
+    """)
+    button.setCursor(QCursor(Qt.PointingHandCursor))
+
+
+class CheckWorker(QThread):
+    progress_update = pyqtSignal(int)
+    add_table_row = pyqtSignal(str, str, str, bool, bool, object, object)
+    update_summary = pyqtSignal(str, str)
+    done = pyqtSignal()
+    sorted_file_generated = pyqtSignal(str, str)  # filename, full path
+
+    def __init__(self, pdf_paths, poppler_path):
+        super().__init__()
+        self.pdf_paths = pdf_paths
+        self.poppler_path = poppler_path
+
+    def detect_stamps(self, img):
+        results = yolo_model(img, conf=0.05, iou=0.5, imgsz=1280)
+        img_area = img.shape[0] * img.shape[1]
+        img_copy = img.copy()
+        count_stamp = 0
+        final_boxes = []
+
+        def iou(box1, box2):
+            xi1 = max(box1[0], box2[0])
+            yi1 = max(box1[1], box2[1])
+            xi2 = min(box1[2], box2[2])
+            yi2 = min(box1[3], box2[3])
+            inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+
+            box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+            box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+            union_area = box1_area + box2_area - inter_area
+
+            return inter_area / union_area if union_area > 0 else 0
+
+        def is_empty_space(img, x1, y1, x2, y2, white_threshold=0.98):
+            crop = img[int(y1):int(y2), int(x1):int(x2)]
+            if crop.size == 0:
+                return True
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            white_ratio = np.mean(gray > 240)
+            return white_ratio > white_threshold
+
+        for box in results[0].boxes:
+            cls = int(box.cls[0].cpu().numpy())
+            if cls == 0:
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                x1, y1, x2, y2 = xyxy
+                w = x2 - x1
+                h = y2 - y1
+                area = w * h
+
+                if area < img_area * 0.005 or area > img_area * 0.5:
+                    continue
+
+                aspect_ratio = w / h if h > 0 else 0
+                if aspect_ratio < 0.7 or aspect_ratio > 1.8:
+                    continue
+
+                if is_empty_space(img, x1, y1, x2, y2):
+                    continue
+
+                if any(iou([x1, y1, x2, y2], fb) > 0.5 for fb in final_boxes):
+                    continue
+
+                final_boxes.append([x1, y1, x2, y2])
+                conf = box.conf[0].cpu().numpy()
+                label = f'stamp {conf:.2f}'
+                cv2.rectangle(img_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(img_copy, label, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                count_stamp += 1
+
+        return count_stamp, img_copy
+
+    def extract_numbers(self, s):
+        nums = re.findall(r'\d+', s)
+        return [int(num) for num in nums] if nums else [-1]
+
+    def extract_info(self, text):
+        do_no_match = re.search(r'DO\s*No\s*:\s*([^\s]+)', text, re.IGNORECASE)
+        do_no = do_no_match.group(1) if do_no_match else "UNKNOWN"
+
+        lines = text.splitlines()
+        company = "UNKNOWN"
+        for idx, line in enumerate(lines):
+            if 'Ship To' in line:
+                if idx + 1 < len(lines):
+                    if lines[idx + 1].strip():
+                        company = lines[idx + 1].split("Attention")[0].strip()
+                    elif idx + 2 < len(lines):
+                        company = lines[idx + 2].split("Attention")[0].strip()
+                break
+        return do_no, company
+
+    def ocr_text_from_image(self, image):
+        config = '--psm 6'
+        try:
+            return pytesseract.image_to_string(image, config=config).strip()
+        except Exception as e:
+            return f"OCR error: {e}"
+
+    def sort_pdf_pages(self, pdf_path, output_path):
+        try:
+            images = convert_from_path(pdf_path, dpi=300, poppler_path=self.poppler_path)
+        except Exception as e:
+            self.add_table_row.emit(f"Error loading PDF for sorting:", str(e), "", True, False, QColor("red"), None)
+            return False
+
+        page_data = []
+        for i, pil_img in enumerate(images):
+            cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            text = self.ocr_text_from_image(cv_img)
+            do_no, company = self.extract_info(text)
+            page_data.append({"index": i, "do_no": do_no, "company": company, "text": text})
+
+        sorted_pages = sorted(
+            page_data,
+            key=lambda x: (
+                x["company"].strip().lower(),
+                self.extract_numbers(x["do_no"].strip())
+            )
+        )
+
+        try:
+            reader = PdfReader(pdf_path)
+            writer = PdfWriter()
+            for page in sorted_pages:
+                writer.add_page(reader.pages[page["index"]])
+            # *** Save to result folder here ***
+            print(f"Saving sorted PDF to: {output_path}")
+            with open(output_path, "wb") as f_out:
+                writer.write(f_out)
+            return True
+        except Exception as e:
+            self.add_table_row.emit(f"Error writing sorted PDF:", str(e), "", True, False, QColor("red"), None)
+            return False
+
+    def run(self):
+        total_files = len(self.pdf_paths)
+        total_pages = 0
+        total_pass = 0
+        total_fail = 0
+        overall_failed_pages = []
+
+        for path in self.pdf_paths:
+            if not os.path.isfile(path):
+                continue
+            try:
+                pages = convert_from_path(path, poppler_path=self.poppler_path)
+            except Exception as e:
+                self.add_table_row.emit(f"Error loading PDF:", os.path.basename(path), str(e), True, False, QColor("red"), None)
+                continue
+
+            self.add_table_row.emit(f"File: {os.path.basename(path)}", "", "", True, False, QColor("#000000"), QColor("#d9d9d9"))
+
+            file_pass = 0
+            file_fail = 0
+            file_failed_pages = []
+
+            for i, page in enumerate(pages):
+                img = np.array(page)
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+                stamp_count, img_with_boxes = self.detect_stamps(img)
+
+                save_path = os.path.join(output_dir, f"page_{i+1}_detected.jpg")
+                cv2.imwrite(save_path, img_with_boxes)
+                print(f"Saved detected image: {save_path}")
+
+                is_pass = stamp_count >= 3
+                result_text = "PASS" if is_pass else "FAIL"
+                display_count = min(stamp_count, 3)
+                fg_color = QColor("green") if is_pass else QColor("red")
+
+                self.add_table_row.emit(f"Page {i + 1}", str(display_count), result_text, False, False, fg_color, None)
+
+                if is_pass:
+                    file_pass += 1
+                else:
+                    file_fail += 1
+                    file_failed_pages.append(str(i + 1))
+
+            self.add_table_row.emit(
+                f"Summary for {os.path.basename(path)}",
+                f"Pages Passed: {file_pass}",
+                f"Pages Failed: {file_fail}",
+                True, True, QColor("blue"), QColor("#e1e1e1")
+            )
+
+            # *** Create output path inside result folder ***
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            output_sorted_pdf = os.path.join(result_folder_full, base_name + "_sorted.pdf")
+
+            success = self.sort_pdf_pages(path, output_sorted_pdf)
+            if success:
+                self.add_table_row.emit(
+                    "Sorted PDF generated:",
+                    output_sorted_pdf,
+                    "",
+                    True, False, QColor("darkblue"), None
+                )
+                self.sorted_file_generated.emit(os.path.basename(output_sorted_pdf), output_sorted_pdf)
+            else:
+                self.add_table_row.emit(
+                    "Sorted PDF generation failed.",
+                    "",
+                    "",
+                    True, False, QColor("red"), None
+                )
+
+            self.add_table_row.emit("", "", "", False, False, None, QColor("#ffffff"))
+
+            total_pages += len(pages)
+            total_pass += file_pass
+            total_fail += file_fail
+            if file_fail > 0:
+                overall_failed_pages.append(f"{os.path.basename(path)} (Pages: {', '.join(file_failed_pages)})")
+
+        overall_summary = (
+            f"Total Files: {total_files}    |    "
+            f"Total Pages: {total_pages}    |    "
+            f"Total Passed: {total_pass}    |    "
+            f"Total Failed: {total_fail}"
+        )
+        failed_text = "All pages passed successfully." if not overall_failed_pages else "Failed Pages:\n" + "\n".join(overall_failed_pages)
+
+        self.update_summary.emit(overall_summary, failed_text)
+        self.done.emit()
+
+
+class StampCheckerApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Stamp Checker")
+        self.setGeometry(150, 100, 1000, 720)
+        self.pdf_paths = []
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+
+        title_label = QLabel("Stamp Checker")
+        title_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+
+        file_layout = QHBoxLayout()
+        self.file_entry = QLineEdit()
+        self.file_entry.setReadOnly(True)
+        self.file_entry.setMinimumHeight(30)
+        font = self.file_entry.font()
+        font.setPointSize(10)
+        self.file_entry.setFont(font)
+        file_layout.addWidget(self.file_entry)
+
+        browse_btn = QPushButton("Browse")
+        style_button(browse_btn)
+        browse_btn.setFixedWidth(100)
+        browse_btn.setToolTip("Select one or more PDF files to check")
+        browse_btn.clicked.connect(self.browse_files)
+        file_layout.addWidget(browse_btn)
+        layout.addLayout(file_layout)
+
+        self.start_btn = QPushButton("Start Checking")
+        self.start_btn.setEnabled(False)
+        self.start_btn.setFixedWidth(150)
+        style_button(self.start_btn, color="#06920D", hover_color="#04730B")
+        self.start_btn.setToolTip("Start checking selected files")
+        self.start_btn.clicked.connect(self.run_check)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.file_label = QLabel("No file loaded")
+        self.file_label.setStyleSheet("font-style: italic; color: gray;")
+        layout.addWidget(self.file_label)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Page", "Stamps Found", "Result"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        header = self.table.horizontalHeader()
+        font = header.font()
+        font.setBold(True)
+        header.setFont(font)
+        layout.addWidget(self.table)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        self.summary_label = QLabel("")
+        self.summary_label.setStyleSheet("font-weight: bold; color: navy;")
+        layout.addWidget(self.summary_label)
+
+        self.failed_pages_label = QLabel("")
+        self.failed_pages_label.setStyleSheet("font-weight: bold; color: red;")
+        layout.addWidget(self.failed_pages_label)
+
+        footer_label = QLabel("© 2025 CODENEST | BY THE ANT. All rights reserved.")
+        footer_label.setStyleSheet("color: gray; font-size: 10px;")
+        footer_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(footer_label)
+
+        self.setLayout(layout)
+
+    def browse_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Select PDF files", "", "PDF Files (*.pdf)")
+        if files:
+            self.pdf_paths = files
+            display_text = ", ".join([os.path.basename(f) for f in files])
+            self.file_entry.setText(display_text)
+            self.file_label.setText(f"Loaded files: {display_text}")
+            self.file_label.setStyleSheet("color: black;")
+            self.start_btn.setEnabled(True)
+
+    def run_check(self):
+        if not self.pdf_paths:
+            QMessageBox.warning(self, "Error", "Please select at least one PDF file.")
+            return
+
+        self.table.setRowCount(0)
+        self.failed_pages_label.setText("")
+        self.summary_label.setText("")
+        self.start_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+
+        self.worker = CheckWorker(self.pdf_paths, poppler_path)
+        self.worker.add_table_row.connect(self.insert_table_row)
+        self.worker.update_summary.connect(self.update_summary_labels)
+        self.worker.done.connect(self.on_check_finished)
+        self.worker.sorted_file_generated.connect(self.on_sorted_file_generated)
+        self.worker.start()
+
+    def on_check_finished(self):
+        self.progress_bar.setVisible(False)
+        self.start_btn.setEnabled(True)
+
+    def insert_table_row(self, col1, col2, col3, bold=False, italic=False, fg_color=None, bg_color=None):
+        row_idx = self.table.rowCount()
+        self.table.insertRow(row_idx)
+        item1 = QTableWidgetItem(col1)
+        item2 = QTableWidgetItem(col2)
+        item3 = QTableWidgetItem(col3)
+        font = item1.font()
+        font.setPointSize(10)
+        font.setBold(bold)
+        font.setItalic(italic)
+        for item in (item1, item2, item3):
+            item.setFont(font)
+            item.setForeground(fg_color or QColor(30, 30, 30))
+            if bg_color:
+                item.setBackground(bg_color)
+        self.table.setItem(row_idx, 0, item1)
+        self.table.setItem(row_idx, 1, item2)
+        self.table.setItem(row_idx, 2, item3)
+
+    def update_summary_labels(self, summary_text, failed_text):
+        self.summary_label.setText(summary_text)
+        self.failed_pages_label.setText(failed_text)
+        self.failed_pages_label.setStyleSheet(
+            "font-weight: bold; color: red;" if "Failed Pages" in failed_text else
+            "font-weight: bold; color: green;"
+        )
+
+    def on_sorted_file_generated(self, filename, filepath):
+        QMessageBox.information(self, "Sorted PDF Generated", f"Sorted PDF saved as:\n{filepath}")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = StampCheckerApp()
+    window.show()
+    sys.exit(app.exec_())
