@@ -127,6 +127,36 @@ def ocr_text_from_image(image):
 
 
 
+# def extract_info(lines):
+#     do_no = "UNKNOWN"
+#     company = "UNKNOWN"
+
+#     # Regex: match lines containing "DO No" (case-insensitive) and capture value after it
+#     do_pattern = re.compile(
+#         r'\bDO\s*No\.?\s*[:\-_\s]*([A-Z0-9\/\- ]+)',  # allow space in capture
+#         re.IGNORECASE
+#     )
+
+#     do_line_index = -1
+#     for idx, line in enumerate(lines):
+#         match = do_pattern.search(line)
+#         if match:
+#             do_no = match.group(1)
+#             # Clean DO number: remove spaces, underscores, colons, periods (keep dash)
+#             do_no = re.sub(r'[\s:._]', '', do_no)
+#             do_line_index = idx
+#             break
+
+#     # Get company from the next line if available
+#     if do_line_index != -1 and do_line_index + 1 < len(lines):
+#         company = lines[do_line_index + 1]
+
+#     # Clean company name
+#     company = re.sub(r'[^A-Za-z0-9 ]+', '', company).upper().strip()
+
+#     return do_no, company
+
+
 def extract_info(lines):
     do_no = "UNKNOWN"
     company = "UNKNOWN"
@@ -137,19 +167,21 @@ def extract_info(lines):
         re.IGNORECASE
     )
 
-    do_line_index = -1
+    # Extract DO number
     for idx, line in enumerate(lines):
         match = do_pattern.search(line)
         if match:
             do_no = match.group(1)
             # Clean DO number: remove spaces, underscores, colons, periods (keep dash)
             do_no = re.sub(r'[\s:._]', '', do_no)
-            do_line_index = idx
             break
 
-    # Get company from the next line if available
-    if do_line_index != -1 and do_line_index + 1 < len(lines):
-        company = lines[do_line_index + 1]
+    # Extract company name: find line containing "Ship To" and take the next line
+    for idx, line in enumerate(lines):
+        if "Ship To" in line:  # case-sensitive, you can add .lower() if needed
+            if idx + 1 < len(lines):
+                company = lines[idx + 1]
+            break
 
     # Clean company name
     company = re.sub(r'[^A-Za-z0-9 ]+', '', company).upper().strip()
